@@ -540,7 +540,7 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		}
 	}
 	effectiveTipU256, _ := uint256.FromBig(effectiveTip)
-
+	log.Info("Effective tip", "effectiveTip", effectiveTipU256)
 	if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
 		// Skip fee payment when NoBaseFee is set and the fee fields
 		// are 0. This avoids a negative effectiveTip being applied to
@@ -554,7 +554,7 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		treasuryAccount := common.HexToAddress("0xfA0B0f5d298d28EFE4d35641724141ef19C05684")
 
 		// Add detailed logging for debugging
-		log.Debug("Fee handling in state transition",
+		log.Info("Fee handling in state transition",
 			"sender", msg.From.String(),
 			"block_number", st.evm.Context.BlockNumber,
 			"zero_fee_addresses_count", len(st.evm.Config.ZeroFeeAddresses),
@@ -569,17 +569,21 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 					"address", addr.String())
 			}
 		}
-
+		// Calculate total fee including base fee
+		totalFee := new(uint256.Int).SetUint64(st.gasUsed())
+		totalFee.Mul(totalFee, uint256.MustFromBig(msg.GasPrice))
 		// Handle zero fee addresses - they get their fees refunded
 		if slices.Contains(st.evm.Config.ZeroFeeAddresses, msg.From) {
-			log.Debug("Refunding fee to zero-fee address",
+			log.Info("Refunding fee to zero-fee address",
 				"address", msg.From.String(),
-				"amount", priorityFee)
-			st.state.AddBalance(msg.From, priorityFee, tracing.BalanceIncreaseRewardTransactionFee)
+				"priority_fee", priorityFee,
+				"total_fee", totalFee)
+			st.state.AddBalance(msg.From, totalFee, tracing.BalanceIncreaseRewardTransactionFee)
 		} else {
-			log.Debug("Sending fee to treasury",
+			log.Info("Sending fee to treasury",
 				"address", treasuryAccount.String(),
-				"amount", priorityFee)
+				"amount", priorityFee,
+				"total_fee", totalFee)
 			st.state.AddBalance(treasuryAccount, priorityFee, tracing.BalanceIncreaseRewardTransactionFee)
 		}
 
