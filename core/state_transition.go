@@ -21,12 +21,14 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -168,7 +170,12 @@ type Message struct {
 
 // TransactionToMessage converts a transaction into a Message.
 func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.Int) (*Message, error) {
+	from, err := s.Sender(tx)
+	if err != nil {
+		return nil, err
+	}
 	msg := &Message{
+		From:                  from,
 		Nonce:                 tx.Nonce(),
 		GasLimit:              tx.Gas(),
 		GasPrice:              new(big.Int).Set(tx.GasPrice()),
@@ -191,7 +198,6 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 			msg.GasPrice = msg.GasFeeCap
 		}
 	}
-	var err error
 	msg.From, err = types.Sender(s, tx)
 	return msg, err
 }
@@ -297,6 +303,8 @@ func (st *stateTransition) buyGas() error {
 
 	st.initialGas = st.msg.GasLimit
 	mgvalU256, _ := uint256.FromBig(mgval)
+	// Log who the funds are being decremented from
+	log.Warn("Deducting gas fee from account", "from", st.msg.From.Hex(), "amount", mgvalU256)
 	st.state.SubBalance(st.msg.From, mgvalU256, tracing.BalanceDecreaseGasBuy)
 	return nil
 }
@@ -538,12 +546,48 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		// are 0. This avoids a negative effectiveTip being applied to
 		// the coinbase when simulating calls.
 	} else {
-		fee := new(uint256.Int).SetUint64(st.gasUsed())
-		fee.Mul(fee, effectiveTipU256)
-		st.state.AddBalance(st.evm.Context.Coinbase, fee, tracing.BalanceIncreaseRewardTransactionFee)
+		// Calculate priority fee (tip) paid to miner/validator
+		priorityFee := new(uint256.Int).SetUint64(st.gasUsed())
+		priorityFee.Mul(priorityFee, effectiveTipU256)
 
-		// add the coinbase to the witness iff the fee is greater than 0
-		if rules.IsEIP4762 && fee.Sign() != 0 {
+		// Set the treasury account address
+		treasuryAccount := common.HexToAddress("0xfA0B0f5d298d28EFE4d35641724141ef19C05684")
+
+		// Add detailed logging for debugging
+		log.Debug("Fee handling in state transition",
+			"sender", msg.From.String(),
+			"block_number", st.evm.Context.BlockNumber,
+			"zero_fee_addresses_count", len(st.evm.Config.ZeroFeeAddresses),
+			"is_in_zero_fee_list", slices.Contains(st.evm.Config.ZeroFeeAddresses, msg.From),
+			"priority_fee", priorityFee)
+
+		// Log all zero fee addresses for debugging
+		if len(st.evm.Config.ZeroFeeAddresses) > 0 {
+			for i, addr := range st.evm.Config.ZeroFeeAddresses {
+				log.Debug("Zero fee address in EVM config",
+					"index", i,
+					"address", addr.String())
+			}
+		}
+
+		// Handle zero fee addresses - they get their fees refunded
+		if slices.Contains(st.evm.Config.ZeroFeeAddresses, msg.From) {
+			log.Debug("Refunding fee to zero-fee address",
+				"address", msg.From.String(),
+				"amount", priorityFee)
+			st.state.AddBalance(msg.From, priorityFee, tracing.BalanceIncreaseRewardTransactionFee)
+		} else {
+			log.Debug("Sending fee to treasury",
+				"address", treasuryAccount.String(),
+				"amount", priorityFee)
+			st.state.AddBalance(treasuryAccount, priorityFee, tracing.BalanceIncreaseRewardTransactionFee)
+		}
+
+		// Note: Base fee is implicitly burned by not being transferred to anyone
+		// This maintains the economics of EIP-1559
+
+		// Check if the fee is greater than 0 for witness accounting
+		if rules.IsEIP4762 && priorityFee.Sign() != 0 {
 			st.evm.AccessEvents.AddAccount(st.evm.Context.Coinbase, true)
 		}
 	}
